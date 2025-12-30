@@ -3,8 +3,11 @@ from urllib.parse import urlparse
 
 from app.core.config import load_env, getenv_required, getenv_default
 from app.core.db import make_engine
+
 from app.routes.health import router as health_router
 from app.routes.sessions import router as sessions_router
+from app.routes.turns import router as turns_router
+
 
 def create_app() -> FastAPI:
     env_path = load_env()
@@ -26,7 +29,9 @@ def create_app() -> FastAPI:
 
     app.include_router(health_router)
     app.include_router(sessions_router)
+    app.include_router(turns_router)
 
     return app
+
 
 app = create_app()
