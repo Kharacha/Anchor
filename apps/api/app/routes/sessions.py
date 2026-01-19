@@ -1,3 +1,5 @@
+from typing import Optional
+
 from fastapi import APIRouter, Request, HTTPException
 from app.schemas.sessions import CreateSessionRequest, CreateSessionResponse
 from app.services.sessions_service import create_session
@@ -6,8 +8,10 @@ router = APIRouter(prefix="/v1", tags=["sessions"])
 
 
 @router.post("/sessions", response_model=CreateSessionResponse)
-def create_session_route(body: CreateSessionRequest, request: Request):
-    tier = body.tier
+def create_session_route(request: Request, body: Optional[CreateSessionRequest] = None):
+    # default tier if client sends no body
+    tier = (body.tier if body is not None else "free")
+
     if tier not in ("free", "paid"):
         raise HTTPException(status_code=400, detail="tier must be 'free' or 'paid'")
 
@@ -26,11 +30,6 @@ def create_session_route(body: CreateSessionRequest, request: Request):
         )
 
     except HTTPException:
-        # pass through explicit HTTP errors unchanged
         raise
     except Exception as e:
-        # return the real error message so you can fix schema/SQL immediately
-        raise HTTPException(
-            status_code=500,
-            detail=f"{type(e).__name__}: {str(e)}",
-        )
+        raise HTTPException(status_code=500, detail=f"{type(e).__name__}: {str(e)}")

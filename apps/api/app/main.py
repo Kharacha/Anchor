@@ -1,4 +1,8 @@
+from dotenv import load_dotenv
+load_dotenv()
+
 from fastapi import FastAPI
+from fastapi.middleware.cors import CORSMiddleware
 from urllib.parse import urlparse
 
 from app.core.config import load_env, getenv_required, getenv_default
@@ -7,6 +11,7 @@ from app.core.db import make_engine
 from app.routes.health import router as health_router
 from app.routes.sessions import router as sessions_router
 from app.routes.turns import router as turns_router
+from app.routes.chunks import router as chunks_router
 
 
 def create_app() -> FastAPI:
@@ -23,6 +28,25 @@ def create_app() -> FastAPI:
 
     app = FastAPI(title="Anchor API", version="0.1.0")
 
+    # -----------------------
+    # CORS (fixes browser OPTIONS preflight)
+    # -----------------------
+    allowed_origins = [
+        "http://localhost:3000",
+        "http://127.0.0.1:3000",
+        # If you ever run Next on another port during dev:
+        "http://localhost:3001",
+        "http://127.0.0.1:3001",
+    ]
+
+    app.add_middleware(
+        CORSMiddleware,
+        allow_origins=allowed_origins,
+        allow_credentials=True,
+        allow_methods=["*"],
+        allow_headers=["*"],
+    )
+
     app.state.engine = engine
     app.state.policy_version = getenv_default("POLICY_VERSION", "v1.0")
     app.state.model_version = getenv_default("MODEL_VERSION", "v1")
@@ -30,6 +54,7 @@ def create_app() -> FastAPI:
     app.include_router(health_router)
     app.include_router(sessions_router)
     app.include_router(turns_router)
+    app.include_router(chunks_router)
 
     return app
 

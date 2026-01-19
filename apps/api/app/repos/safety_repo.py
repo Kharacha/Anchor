@@ -1,3 +1,4 @@
+import json
 from sqlalchemy import text
 
 def insert_safety_event(
@@ -37,3 +38,33 @@ def insert_safety_event(
             "model_version": model_version,
         },
     )
+
+def get_latest_input_safety(conn, session_id: str, turn_id: str):
+    row = conn.execute(
+        text("""
+            select classification
+            from safety_events
+            where session_id = :session_id
+              and turn_id = :turn_id
+              and stage = 'input'
+            order by created_at desc
+            limit 1
+        """),
+        {"session_id": session_id, "turn_id": turn_id},
+    ).first()
+
+    if not row:
+        return {"label": "allow", "reasons": [], "meta": {}}
+
+    val = row[0]
+    # jsonb usually comes back as dict; be safe in case it's a string
+    if isinstance(val, str):
+        try:
+            return json.loads(val)
+        except Exception:
+            return {"label": "allow", "reasons": [], "meta": {}}
+
+    if isinstance(val, dict):
+        return val
+
+    return {"label": "allow", "reasons": [], "meta": {}}
