@@ -34,5 +34,14 @@ class FinalizeTurnResponse(BaseModel):
     assistant_text: str
     input_safety: SafetyResult
     fallback_used: bool = False
-
     analysis: Optional[Dict[str, Any]] = None
+
+
+# -------------------------------
+# NEW: Audio upload response schema
+# -------------------------------
+class AudioUploadResponse(BaseModel):
+    transcript: str
+    confidence: Optional[float] = None
+    content_type: Optional[str] = None
+    bytes: Optional[int] = None

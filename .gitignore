@@ -11,7 +11,7 @@ __pycache__/
 
 # Env files (secrets)
 apps/api/.env
-apps/web/.env.local
+apps/frontend/.env.local
 
 # OS / IDE
 .DS_Store

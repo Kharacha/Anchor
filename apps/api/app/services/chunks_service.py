@@ -8,6 +8,7 @@ from app.services.scoring_service import score_text
 from app.services.safety_service import classify_input, to_json
 from app.services.baselines_service import update_user_baseline_if_opted_in
 from app.services.response_service import generate_assistant_response
+from app.services.transcription_service import transcribe_upload_file
 
 
 SAFE_BLOCK_MESSAGE = (
@@ -26,6 +27,8 @@ def _chunk_conf_value(chunk: dict) -> float | None:
     c = chunk.get("confidence", None)
     if c is None:
         c = chunk.get("transcript_confidence", None)
+    if c is None:
+        c = chunk.get("chunk_confidence", None)
     try:
         if c is None:
             return None
@@ -128,6 +131,61 @@ def append_chunk(engine, session_id: str, turn_id: str, chunk_index: int, text: 
         )
 
     return int(seq)
+
+
+def upload_audio(engine, session_id: str, turn_id: str, upload_file, policy_version: str, model_version: str):
+    """
+    Transcribe audio -> store as chunk_index=0 so the rest of the pipeline is unchanged.
+    Returns: (seq, transcript, transcript_confidence_or_none)
+    """
+    with engine.begin() as conn:
+        if not turns_repo.turn_belongs_to_session(conn, turn_id=turn_id, session_id=session_id):
+            raise ValueError("turn not found for this session")
+
+        transcript, conf = transcribe_upload_file(upload_file)
+        transcript = (transcript or "").strip()
+        if not transcript:
+            raise ValueError("transcription_empty")
+
+        # Use SDK-provided confidence if present, else default chunk conf
+        chunk_conf = None
+        try:
+            if conf is not None:
+                chunk_conf = max(0.0, min(float(conf), 1.0))
+            else:
+                chunk_conf = 0.9
+        except Exception:
+            chunk_conf = 0.9
+
+        # Store transcript as a chunk (idempotent upsert)
+        _utterance_id, seq = turns_repo.upsert_user_chunk(
+            conn,
+            session_id=session_id,
+            turn_id=turn_id,
+            chunk_index=0,
+            text_content=transcript,
+            chunk_confidence=chunk_conf,
+        )
+
+        if not audit_repo.audit_event_exists(conn, session_id=session_id, event_type="audio_transcribed", turn_id=turn_id):
+            audit_repo.insert_audit(
+                conn,
+                session_id=session_id,
+                event_type="audio_transcribed",
+                data_json=to_json(
+                    {
+                        "turn_id": turn_id,
+                        "filename": getattr(upload_file, "filename", None),
+                        "text_len": len(transcript),
+                        "confidence": chunk_conf,
+                    }
+                ),
+                policy_version=policy_version,
+                model_version=model_version,
+                turn_id=turn_id,
+            )
+
+    return int(seq), transcript, conf
 
 
 def finalize_turn(engine, session_id: str, turn_id: str, policy_version: str, model_version: str):
@@ -387,7 +445,6 @@ def finalize_turn(engine, session_id: str, turn_id: str, policy_version: str, mo
             mode = resp.get("mode", "neutral")
             response_error = resp.get("error")
 
-        # stash analysis for frontend
         analysis["mode"] = mode
         analysis["response_source"] = response_source
         if response_error:
@@ -402,7 +459,11 @@ def finalize_turn(engine, session_id: str, turn_id: str, policy_version: str, mo
             model_version=model_version,
             draft_text=None,
             fallback_used=(response_source != "openai"),
-            fallback_type=("safety_block" if safety.get("label") == "block" else ("llm_fallback" if response_source != "openai" else None)),
+            fallback_type=(
+                "safety_block"
+                if safety.get("label") == "block"
+                else ("llm_fallback" if response_source != "openai" else None)
+            ),
             evidence_json="{}",
         )
         turns_repo.insert_utterance(
@@ -414,7 +475,6 @@ def finalize_turn(engine, session_id: str, turn_id: str, policy_version: str, mo
             chunk_index=0,
         )
 
-        # optional audit: assistant_generated
         if not audit_repo.audit_event_exists(conn, session_id=session_id, event_type="assistant_generated", turn_id=turn_id):
             audit_repo.insert_audit(
                 conn,
@@ -438,7 +498,9 @@ def finalize_turn(engine, session_id: str, turn_id: str, policy_version: str, mo
                 conn,
                 session_id=session_id,
                 event_type="turn_complete",
-                data_json=to_json({"turn_id": turn_id, "fallback_used": (response_source != "openai"), "gated": False, "mode": "chunked"}),
+                data_json=to_json(
+                    {"turn_id": turn_id, "fallback_used": (response_source != "openai"), "gated": False, "mode": "chunked"}
+                ),
                 policy_version=policy_version,
                 model_version=model_version,
                 turn_id=turn_id,
