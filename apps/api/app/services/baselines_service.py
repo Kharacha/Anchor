@@ -21,6 +21,10 @@ DEFAULT_MIN_WEIGHT = 0.05         # minimum weight for updates when confidence i
 EPS = 1e-6
 
 
+# =========================================================
+# BASELINES (your existing baseline logic)
+# =========================================================
+
 def _clamp(x: float, lo: float, hi: float) -> float:
     return max(lo, min(hi, x))
 
@@ -105,11 +109,12 @@ def update_user_baseline_if_opted_in(
     sr = _safe_float(speech_rate_wpm)
     pr = _safe_float(pause_ratio)
 
+    # Nothing to update
     if v is None and a is None and sr is None and pr is None:
         return None
 
     # Use confidence as update weight
-    # - OpenAI confidence measures "emotion scoring confidence"
+    # - confidence measures "emotion scoring confidence"
     # - transcript_confidence measures "STT confidence"
     # Weight should be conservative if either is low.
     w1 = 1.0 if c is None else _clamp(c, 0.0, 1.0)
@@ -256,4 +261,5 @@ def update_user_baseline_if_opted_in(
         session_id=session_id,
         data_json=json.dumps(payload),
     )
+
     return payload

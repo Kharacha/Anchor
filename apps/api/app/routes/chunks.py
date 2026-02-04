@@ -1,4 +1,5 @@
 import logging
+import json
 from fastapi import APIRouter, Request, HTTPException, UploadFile, File
 
 from app.schemas.chunks import (
@@ -12,7 +13,7 @@ from app.schemas.chunks import (
 )
 from app.services.chunks_service import start_turn, append_chunk, finalize_turn
 from app.services.transcription_service import transcribe_upload_file
-from app.repos import turns_repo
+from app.repos import turns_repo, audit_repo
 
 logger = logging.getLogger(__name__)
 
@@ -86,33 +87,28 @@ def finalize_turn_route(session_id: str, turn_id: str, body: FinalizeTurnRequest
         raise HTTPException(status_code=500, detail=f"{type(e).__name__}: {str(e)}")
 
 
-# -------------------------------
-# NEW: Audio upload -> transcription
-# -------------------------------
 @router.post(
     "/sessions/{session_id}/turns/{turn_id}/audio",
     response_model=AudioUploadResponse,
 )
 def upload_audio(session_id: str, turn_id: str, request: Request, file: UploadFile = File(...)):
     """
-    Accepts multipart/form-data with a single file field named 'file'.
-    Returns stable schema:
-      { "transcript": str, "confidence": float|null, "content_type": str|null, "bytes": int|null }
+    Accepts multipart/form-data with field 'file'.
+    Returns: { transcript, confidence|null, content_type|null, bytes|null }
     """
     try:
         engine = request.app.state.engine
+        policy_version = request.app.state.policy_version
+        model_version = request.app.state.model_version
 
-        # (3) Validate turn belongs to session
         with engine.begin() as conn:
             ok = turns_repo.turn_belongs_to_session(conn, turn_id=turn_id, session_id=session_id)
         if not ok:
             raise HTTPException(status_code=404, detail="turn not found for this session")
 
-        # Log basic file metadata
         content_type = getattr(file, "content_type", None)
         filename = getattr(file, "filename", None)
 
-        # Compute size without reading whole file into memory
         size_bytes = None
         try:
             file.file.seek(0, 2)
@@ -121,13 +117,36 @@ def upload_audio(session_id: str, turn_id: str, request: Request, file: UploadFi
         except Exception:
             pass
 
-        logger.info(f"/audio upload: session={session_id} turn={turn_id} filename={filename} type={content_type} bytes={size_bytes}")
+        logger.info(
+            f"/audio upload: session={session_id} turn={turn_id} filename={filename} type={content_type} bytes={size_bytes}"
+        )
 
-        # (2) Empty / tiny audio guard (common when recorder didn't capture)
         if size_bytes is not None and size_bytes < 4000:
             return AudioUploadResponse(transcript="", confidence=None, content_type=content_type, bytes=size_bytes)
 
         transcript, conf = transcribe_upload_file(file)
+
+        # If transcription failed (quota, etc.), log audit error but keep response stable
+        if not (transcript or "").strip():
+            with engine.begin() as conn:
+                audit_repo.insert_audit(
+                    conn,
+                    session_id=session_id,
+                    event_type="error",
+                    data_json=json.dumps(
+                        {
+                            "where": "transcription",
+                            "turn_id": turn_id,
+                            "reason": "empty_transcript (possible quota/billing)",
+                            "content_type": content_type,
+                            "bytes": size_bytes,
+                        }
+                    ),
+                    policy_version=policy_version,
+                    model_version=model_version,
+                    turn_id=turn_id,
+                )
+            return AudioUploadResponse(transcript="", confidence=None, content_type=content_type, bytes=size_bytes)
 
         return AudioUploadResponse(
             transcript=transcript or "",

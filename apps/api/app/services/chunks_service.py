@@ -2,13 +2,13 @@
 
 from sqlalchemy import text
 import re
+import datetime
 
-from app.repos import turns_repo, sessions_repo, safety_repo, audit_repo, user_settings_repo
+from app.repos import turns_repo, sessions_repo, safety_repo, audit_repo, user_settings_repo, trends_repo
 from app.services.scoring_service import score_text
 from app.services.safety_service import classify_input, to_json
 from app.services.baselines_service import update_user_baseline_if_opted_in
 from app.services.response_service import generate_assistant_response
-from app.services.transcription_service import transcribe_upload_file
 
 
 SAFE_BLOCK_MESSAGE = (
@@ -133,61 +133,6 @@ def append_chunk(engine, session_id: str, turn_id: str, chunk_index: int, text: 
     return int(seq)
 
 
-def upload_audio(engine, session_id: str, turn_id: str, upload_file, policy_version: str, model_version: str):
-    """
-    Transcribe audio -> store as chunk_index=0 so the rest of the pipeline is unchanged.
-    Returns: (seq, transcript, transcript_confidence_or_none)
-    """
-    with engine.begin() as conn:
-        if not turns_repo.turn_belongs_to_session(conn, turn_id=turn_id, session_id=session_id):
-            raise ValueError("turn not found for this session")
-
-        transcript, conf = transcribe_upload_file(upload_file)
-        transcript = (transcript or "").strip()
-        if not transcript:
-            raise ValueError("transcription_empty")
-
-        # Use SDK-provided confidence if present, else default chunk conf
-        chunk_conf = None
-        try:
-            if conf is not None:
-                chunk_conf = max(0.0, min(float(conf), 1.0))
-            else:
-                chunk_conf = 0.9
-        except Exception:
-            chunk_conf = 0.9
-
-        # Store transcript as a chunk (idempotent upsert)
-        _utterance_id, seq = turns_repo.upsert_user_chunk(
-            conn,
-            session_id=session_id,
-            turn_id=turn_id,
-            chunk_index=0,
-            text_content=transcript,
-            chunk_confidence=chunk_conf,
-        )
-
-        if not audit_repo.audit_event_exists(conn, session_id=session_id, event_type="audio_transcribed", turn_id=turn_id):
-            audit_repo.insert_audit(
-                conn,
-                session_id=session_id,
-                event_type="audio_transcribed",
-                data_json=to_json(
-                    {
-                        "turn_id": turn_id,
-                        "filename": getattr(upload_file, "filename", None),
-                        "text_len": len(transcript),
-                        "confidence": chunk_conf,
-                    }
-                ),
-                policy_version=policy_version,
-                model_version=model_version,
-                turn_id=turn_id,
-            )
-
-    return int(seq), transcript, conf
-
-
 def finalize_turn(engine, session_id: str, turn_id: str, policy_version: str, model_version: str):
     with engine.begin() as conn:
         if not turns_repo.turn_belongs_to_session(conn, turn_id=turn_id, session_id=session_id):
@@ -309,6 +254,8 @@ def finalize_turn(engine, session_id: str, turn_id: str, policy_version: str, mo
         baseline_update = None
 
         user_id = sessions_repo.get_session_user_id(conn, session_id)
+        baseline_opt_in = False
+
         if user_id:
             user_id = str(user_id)
 
@@ -331,6 +278,36 @@ def finalize_turn(engine, session_id: str, turn_id: str, policy_version: str, mo
 
             if baseline_update:
                 analysis["baseline_update"] = baseline_update
+
+                # Audit baseline_updated (enum exists)
+                if not audit_repo.audit_event_exists(
+                    conn, session_id=session_id, event_type="baseline_updated", turn_id=turn_id
+                ):
+                    audit_repo.insert_audit(
+                        conn,
+                        session_id=session_id,
+                        event_type="baseline_updated",
+                        data_json=to_json({"turn_id": turn_id, "updated": True}),
+                        policy_version=policy_version,
+                        model_version=model_version,
+                        turn_id=turn_id,
+                    )
+
+            # -----------------------
+            # DAILY TRENDS (derived scores only)
+            # Only update if baseline_opt_in is true (opt-in requirement).
+            # -----------------------
+            if baseline_opt_in:
+                day = datetime.date.today().isoformat()
+                trends_repo.upsert_daily_bucket(
+                    conn,
+                    user_id=user_id,
+                    day=day,
+                    valence=float(scores["valence"]),
+                    arousal=float(scores["arousal"]),
+                    confidence=float(scores["confidence"]),
+                    extremeness=float(scores["extremeness"]),
+                )
 
         # -----------------------
         # GATE handling
