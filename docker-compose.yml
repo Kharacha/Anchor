@@ -1,0 +1,34 @@
+services:
+  api:
+    build:
+      context: ./apps/api
+      dockerfile: Dockerfile
+    env_file:
+      - ./apps/api/.env
+    environment:
+      - SELF_HOSTED_STT_URL=http://stt:8001/transcribe
+      - SELF_HOSTED_STT_TIMEOUT_S=180
+      - SELF_HOSTED_STT_MAX_ATTEMPTS=2
+    ports:
+      - "8000:8000"
+    depends_on:
+      - stt
+
+  stt:
+    build:
+      context: ./apps/stt
+      dockerfile: Dockerfile
+    environment:
+      - WHISPER_MODEL=small
+      - WHISPER_DEVICE=cpu
+      - WHISPER_COMPUTE_TYPE=int8
+      - STT_LANG=en
+      - STT_VAD_FILTER=true
+      - STT_BEAM_SIZE=5
+    ports:
+      - "8001:8001"
+    volumes:
+      - stt_cache:/root/.cache
+
+volumes:
+  stt_cache:

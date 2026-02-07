@@ -2,15 +2,115 @@
 
 import { useEffect, useMemo, useRef, useState } from "react";
 import {
-  appendChunk,
   createSession,
-  finalizeTurn,
   getDailyTrends,
-  startTurn,
-  uploadAudio,
+  ingestTurn,
+  ingestTurnAudioFallback,
   type DailyTrendPoint,
   type Safety,
 } from "../lib/api";
+
+/* =========================================================
+   On-device STT (Web Speech API) — ONLY when toggle is enabled
+   ========================================================= */
+
+type SpeechRecognizer = {
+  start: () => void;
+  stop: () => Promise<{ ok: true; text: string } | { ok: false; reason: string }>;
+  onInterim?: (t: string) => void;
+};
+
+function normalizeSpaces(s: string) {
+  return (s || "").replace(/\s+/g, " ").trim();
+}
+
+function createOnDeviceRecognizer(): SpeechRecognizer | null {
+  const w = window as any;
+  const SR = w.SpeechRecognition || w.webkitSpeechRecognition;
+  if (!SR) return null;
+
+  const rec = new SR();
+  rec.continuous = true;
+  rec.interimResults = true;
+  rec.lang = "en-US";
+
+  let finalText = "";
+  let interimText = "";
+
+  const api: SpeechRecognizer = {
+    start() {
+      finalText = "";
+      interimText = "";
+      try {
+        rec.start();
+      } catch {
+        // start can throw if called too quickly; we handle via fallback path
+      }
+    },
+    stop() {
+      return new Promise((resolve) => {
+        let settled = false;
+
+        const finish = () => {
+          const text = normalizeSpaces((finalText + " " + interimText).trim());
+          if (!text) return resolve({ ok: false, reason: "empty_transcript" });
+          resolve({ ok: true, text });
+        };
+
+        const timeout = setTimeout(() => {
+          if (settled) return;
+          settled = true;
+          finish();
+        }, 1200);
+
+        const prevEnd = rec.onend;
+        rec.onend = () => {
+          try {
+            prevEnd?.();
+          } catch {}
+          clearTimeout(timeout);
+          if (settled) return;
+          settled = true;
+          finish();
+        };
+
+        try {
+          rec.stop();
+        } catch {
+          clearTimeout(timeout);
+          resolve({ ok: false, reason: "stop_failed" });
+        }
+      });
+    },
+  };
+
+  rec.onresult = (event: any) => {
+    interimText = "";
+    for (let i = event.resultIndex; i < event.results.length; i++) {
+      const res = event.results[i];
+      const txt = normalizeSpaces(res?.[0]?.transcript || "");
+      if (!txt) continue;
+
+      if (res.isFinal) {
+        // NOTE: do NOT force punctuation — it makes it worse.
+        finalText = normalizeSpaces(finalText + " " + txt);
+      } else {
+        interimText = normalizeSpaces(interimText + " " + txt);
+      }
+    }
+    api.onInterim?.(normalizeSpaces((finalText + " " + interimText).trim()));
+  };
+
+  rec.onerror = () => {
+    // handled by stop() outcome; we’ll fallback if empty
+  };
+
+  return api;
+}
+
+/* =========================================================
+   UI types
+   ========================================================= */
 
 type Msg = { id: string; role: "user" | "assistant"; text: string };
 
@@ -20,26 +120,6 @@ function uid() {
 
 function clamp01(x: number) {
   return Math.max(0, Math.min(1, x));
-}
-
-/**
- * Prevents a UI indicator from flashing for ultra-fast operations.
- * Example: delay 150ms so it only appears if it actually takes a moment.
- */
-function useDelayedFlag(flag: boolean, delayMs = 150) {
-  const [show, setShow] = useState(false);
-
-  useEffect(() => {
-    let t: any;
-    if (flag) {
-      t = setTimeout(() => setShow(true), delayMs);
-    } else {
-      setShow(false);
-    }
-    return () => clearTimeout(t);
-  }, [flag, delayMs]);
-
-  return show;
 }
 
 function LineSpark({
@@ -57,11 +137,15 @@ function LineSpark({
   const vals = points
       .map((p) => accessor(p))
       .filter((v): v is number => typeof v === "number" && !Number.isNaN(v));
+
   if (vals.length < 2) {
-    return <div className="rounded-xl border bg-white p-4 text-sm text-zinc-600">Not enough data yet.</div>;
+    return (
+        <div className="rounded-xl border bg-white p-4 text-sm text-zinc-600">
+          Not enough data yet.
+        </div>
+    );
   }
 
-  // For valence [-1,1], normalize to [0,1] for plotting. For others already [0,1].
   const norm = (v: number) => {
     if (v < 0 || v > 1) return clamp01((v + 1) / 2);
     return clamp01(v);
@@ -98,37 +182,71 @@ function LineSpark({
   );
 }
 
+const LS_KEY_ONDEVICE_ONLY = "anchor_ondevice_only_v1";
+
 export default function Home() {
   const [tab, setTab] = useState<"chat" | "trends">("chat");
 
   const [sessionId, setSessionId] = useState("");
   const [messages, setMessages] = useState<Msg[]>([]);
-  const [status, setStatus] = useState<"idle" | "recording" | "sending">("idle");
+  const [status, setStatus] = useState<"idle" | "recording" | "transcribing" | "reflecting">("idle");
 
   const [lastSafety, setLastSafety] = useState<Safety | null>(null);
   const [lastMode, setLastMode] = useState("neutral");
+
+  // HYBRID toggle:
+  // false = Default (server Whisper, best quality)
+  // true  = On-device only (no audio upload, lower quality)
+  const [onDeviceOnly, setOnDeviceOnly] = useState(false);
 
   const mediaRecorderRef = useRef<MediaRecorder | null>(null);
   const mediaStreamRef = useRef<MediaStream | null>(null);
   const audioChunksRef = useRef<Blob[]>([]);
 
+  const recognizerRef = useRef<SpeechRecognizer | null>(null);
+  const [liveTranscript, setLiveTranscript] = useState("");
+
+  // Pause/duration tracking (cheap amplitude-based)
+  const audioCtxRef = useRef<AudioContext | null>(null);
+  const analyserRef = useRef<AnalyserNode | null>(null);
+  const pauseStatsRef = useRef({ totalMs: 0, silentMs: 0, rafId: 0 as any });
+
   const [trendPoints, setTrendPoints] = useState<DailyTrendPoint[] | null>(null);
   const [trendsErr, setTrendsErr] = useState<string | null>(null);
   const [trendsLoading, setTrendsLoading] = useState(false);
 
-  // NEW: processing-phase flags
-  const [isListening, setIsListening] = useState(false);   // “Listening carefully…”
-  const [isReflecting, setIsReflecting] = useState(false); // “Reflecting on what you shared…”
-
-  // avoid flicker
-  const showListening = useDelayedFlag(isListening, 150);
-  const showReflecting = useDelayedFlag(isReflecting, 150);
-
-  const processingText =
-      showListening ? "Listening carefully…" : showReflecting ? "Reflecting on what you shared…" : null;
-
   const canStart = useMemo(() => status === "idle" && !!sessionId, [status, sessionId]);
   const canStop = useMemo(() => status === "recording", [status]);
+
+  useEffect(() => {
+    // Load toggle
+    try {
+      const raw = localStorage.getItem(LS_KEY_ONDEVICE_ONLY);
+      if (raw === "1") setOnDeviceOnly(true);
+    } catch {}
+  }, []);
+
+  useEffect(() => {
+    try {
+      localStorage.setItem(LS_KEY_ONDEVICE_ONLY, onDeviceOnly ? "1" : "0");
+    } catch {}
+  }, [onDeviceOnly]);
+
+  useEffect(() => {
+    // Breathing animation (85% <-> 100% opacity)
+    const style = document.createElement("style");
+    style.innerHTML = `
+      @keyframes anchorBreathe {
+        0% { opacity: 0.85; }
+        50% { opacity: 1; }
+        100% { opacity: 0.85; }
+      }
+    `;
+    document.head.appendChild(style);
+    return () => {
+      document.head.removeChild(style);
+    };
+  }, []);
 
   useEffect(() => {
     (async () => {
@@ -166,11 +284,82 @@ export default function Home() {
     return "";
   }
 
+  function startPauseTracking(stream: MediaStream) {
+    const AudioCtx = (window as any).AudioContext || (window as any).webkitAudioContext;
+    if (!AudioCtx) return;
+
+    const ctx = new AudioCtx();
+    const source = ctx.createMediaStreamSource(stream);
+    const analyser = ctx.createAnalyser();
+    analyser.fftSize = 2048;
+    source.connect(analyser);
+
+    audioCtxRef.current = ctx;
+    analyserRef.current = analyser;
+
+    const data = new Uint8Array(analyser.fftSize);
+    pauseStatsRef.current.totalMs = 0;
+    pauseStatsRef.current.silentMs = 0;
+
+    const threshold = 0.02;
+
+    const tick = () => {
+      analyser.getByteTimeDomainData(data);
+      let sum = 0;
+      for (let i = 0; i < data.length; i++) {
+        const v = (data[i] - 128) / 128;
+        sum += v * v;
+      }
+      const rms = Math.sqrt(sum / data.length);
+
+      pauseStatsRef.current.totalMs += 16;
+      if (rms < threshold) pauseStatsRef.current.silentMs += 16;
+
+      pauseStatsRef.current.rafId = requestAnimationFrame(tick);
+    };
+
+    pauseStatsRef.current.rafId = requestAnimationFrame(tick);
+  }
+
+  async function stopPauseTracking() {
+    try {
+      cancelAnimationFrame(pauseStatsRef.current.rafId);
+    } catch {}
+
+    const totalMs = pauseStatsRef.current.totalMs || 0;
+    const silentMs = pauseStatsRef.current.silentMs || 0;
+
+    try {
+      await audioCtxRef.current?.close();
+    } catch {}
+    audioCtxRef.current = null;
+    analyserRef.current = null;
+
+    const pause_ratio = totalMs > 0 ? silentMs / totalMs : 0;
+    return { duration_ms: totalMs, pause_ratio: Math.max(0, Math.min(1, pause_ratio)) };
+  }
+
   async function startRecording() {
     try {
+      setLiveTranscript("");
+      recognizerRef.current = null;
+
       const stream = await navigator.mediaDevices.getUserMedia({ audio: true });
       mediaStreamRef.current = stream;
 
+      startPauseTracking(stream);
+
+      // Only start on-device recognizer when toggle is enabled
+      if (onDeviceOnly) {
+        recognizerRef.current = createOnDeviceRecognizer();
+        if (recognizerRef.current) {
+          recognizerRef.current.onInterim = (t) => setLiveTranscript(t);
+          recognizerRef.current.start();
+        }
+      }
+
+      // Always record audio in memory (even in on-device-only mode)
+      // This enables future “send anyway?” UX, and makes fallback easy to add later.
       const mimeType = pickMimeType();
       const mr = mimeType ? new MediaRecorder(stream, { mimeType }) : new MediaRecorder(stream);
 
@@ -186,7 +375,11 @@ export default function Home() {
       console.error(e);
       setMessages((prev) => [
         ...prev,
-        { id: uid(), role: "assistant", text: "I couldn’t access your microphone. Please allow mic permissions and try again." },
+        {
+          id: uid(),
+          role: "assistant",
+          text: "I couldn’t access your microphone. Please allow mic permissions and try again.",
+        },
       ]);
       setStatus("idle");
     }
@@ -196,64 +389,99 @@ export default function Home() {
     const mr = mediaRecorderRef.current;
     if (!mr) return;
 
-    setStatus("sending");
+    setStatus("transcribing");
 
     mr.onstop = async () => {
-      const resetIndicators = () => {
-        setIsListening(false);
-        setIsReflecting(false);
-      };
-
       try {
         mediaStreamRef.current?.getTracks().forEach((t) => t.stop());
       } catch {}
       mediaStreamRef.current = null;
       mediaRecorderRef.current = null;
 
+      const pauseStats = await stopPauseTracking();
       const blob = new Blob(audioChunksRef.current, { type: mr.mimeType || "audio/webm" });
 
-      if (!blob || blob.size < 4000) {
-        setMessages((prev) => [
-          ...prev,
-          { id: uid(), role: "assistant", text: "I didn’t catch any audio. Try speaking a little louder and press Stop again." },
-        ]);
-        resetIndicators();
-        setStatus("idle");
-        return;
-      }
+      // ============
+      // Path A: On-device only (no audio upload)
+      // ============
+      if (onDeviceOnly) {
+        let transcript = "";
 
-      try {
-        const start = await startTurn(sessionId);
-        const turnId = start.turn_id;
-
-        // Phase 1: STT/transcript processing
-        setIsListening(true);
-        setIsReflecting(false);
-
-        const audio = await uploadAudio(sessionId, turnId, blob);
-        const transcript = (audio.transcript || "").trim();
+        if (recognizerRef.current) {
+          const out = await recognizerRef.current.stop();
+          if (out.ok) transcript = normalizeSpaces(out.text);
+        }
 
         if (!transcript) {
-          setMessages((prev) => [...prev, { id: uid(), role: "assistant", text: "I had trouble hearing that. Try again?" }]);
-          resetIndicators();
+          setMessages((prev) => [
+            ...prev,
+            { id: uid(), role: "assistant", text: "I didn’t catch that clearly. Try again?" },
+          ]);
           setStatus("idle");
           return;
         }
 
-        setMessages((prev) => [...prev, { id: uid(), role: "user", text: transcript }]);
+        try {
+          setStatus("reflecting");
 
-        await appendChunk(sessionId, turnId, transcript, (audio.confidence ?? 0.9) as number);
+          const words = transcript.split(/\s+/).filter(Boolean).length;
+          const duration_ms = pauseStats.duration_ms;
+          const pause_ratio = pauseStats.pause_ratio;
+          const speech_rate = duration_ms > 0 ? words / (duration_ms / 1000) : undefined;
 
-        // Phase 2: response formulation
-        setIsListening(false);
-        setIsReflecting(true);
+          setMessages((prev) => [...prev, { id: uid(), role: "user", text: transcript }]);
 
-        const fin = await finalizeTurn(sessionId, turnId);
+          const res = await ingestTurn(sessionId, {
+            input_mode: "voice",
+            transcript_text: transcript,
+            transcript_confidence: null,
+            speech_features: { duration_ms, speech_rate, pause_ratio },
+            stt_provider_used: "on_device",
+            fallback_used: false,
+            client_latency_ms: { record_ms: duration_ms, stt_ms: undefined },
+          });
 
-        setLastSafety(fin.input_safety);
-        setLastMode((fin.analysis?.mode as string) || "neutral");
+          setLastSafety(res.input_safety);
+          setLastMode((res.analysis?.mode as string) || "neutral");
+          setMessages((prev) => [...prev, { id: uid(), role: "assistant", text: res.assistant_text }]);
+        } catch (e) {
+          console.error(e);
+          setMessages((prev) => [
+            ...prev,
+            { id: uid(), role: "assistant", text: "Something went wrong while processing your voice. Try again?" },
+          ]);
+        } finally {
+          setStatus("idle");
+        }
 
-        setMessages((prev) => [...prev, { id: uid(), role: "assistant", text: fin.assistant_text }]);
+        return;
+      }
+
+      // ============
+      // Path B: Default server Whisper (best quality)
+      // ============
+      try {
+        setStatus("reflecting");
+
+        if (!blob || blob.size < 4000) {
+          setMessages((prev) => [
+            ...prev,
+            { id: uid(), role: "assistant", text: "I didn’t catch any audio. Try again?" },
+          ]);
+          setStatus("idle");
+          return;
+        }
+
+        const res = await ingestTurnAudioFallback(sessionId, blob);
+
+        const finalTranscript = normalizeSpaces(res.transcript || "");
+        if (finalTranscript) {
+          setMessages((prev) => [...prev, { id: uid(), role: "user", text: finalTranscript }]);
+        }
+
+        setLastSafety(res.input_safety);
+        setLastMode((res.analysis?.mode as string) || "neutral");
+        setMessages((prev) => [...prev, { id: uid(), role: "assistant", text: res.assistant_text }]);
       } catch (e) {
         console.error(e);
         setMessages((prev) => [
@@ -261,7 +489,6 @@ export default function Home() {
           { id: uid(), role: "assistant", text: "Something went wrong while processing your voice. Try again?" },
         ]);
       } finally {
-        resetIndicators();
         setStatus("idle");
       }
     };
@@ -269,34 +496,51 @@ export default function Home() {
     try {
       mr.stop();
     } catch {
-      setIsListening(false);
-      setIsReflecting(false);
       setStatus("idle");
     }
   }
 
   return (
       <div className="min-h-screen bg-zinc-50 px-6 py-10 text-zinc-900">
-        {/* Breathing animation (85% <-> 100% opacity) */}
-        <style jsx global>{`
-        @keyframes breath {
-          0% {
-            opacity: 0.85;
-          }
-          50% {
-            opacity: 1;
-          }
-          100% {
-            opacity: 0.85;
-          }
-        }
-      `}</style>
-
         <div className="mx-auto w-full max-w-3xl">
           <h1 className="text-3xl font-semibold tracking-tight text-zinc-900">Anchor (voice)</h1>
 
           <div className="mt-1 text-sm text-zinc-800">
             Session: <span className="font-mono text-zinc-900">{sessionId || "creating..."}</span>
+          </div>
+
+          {/* Privacy / STT mode toggle */}
+          <div className="mt-4 rounded-2xl border bg-white p-4">
+            <div className="flex items-start justify-between gap-4">
+              <div>
+                <div className="text-sm font-semibold text-zinc-900">Speech-to-text mode</div>
+                <div className="mt-1 text-sm text-zinc-600">
+                  Default uses <span className="font-medium text-zinc-900">Anchor’s server STT</span> for best punctuation and question detection.
+                  <br />
+                  <span className="font-medium text-zinc-900">On-device only</span> keeps audio on your device but may be less accurate.
+                </div>
+              </div>
+
+              <label className="flex items-center gap-3 select-none">
+                <span className="text-sm text-zinc-700">On-device only</span>
+                <button
+                    type="button"
+                    onClick={() => setOnDeviceOnly((v) => !v)}
+                    className={[
+                      "relative inline-flex h-7 w-12 items-center rounded-full transition",
+                      onDeviceOnly ? "bg-zinc-900" : "bg-zinc-300",
+                    ].join(" ")}
+                    aria-pressed={onDeviceOnly}
+                >
+                <span
+                    className={[
+                      "inline-block h-5 w-5 transform rounded-full bg-white transition",
+                      onDeviceOnly ? "translate-x-6" : "translate-x-1",
+                    ].join(" ")}
+                />
+                </button>
+              </label>
+            </div>
           </div>
 
           {/* Tabs */}
@@ -343,15 +587,27 @@ export default function Home() {
                       ))
                   )}
 
-                  {/* NEW: In-chat assistant processing bubble (not persisted) */}
-                  {processingText ? (
+                  {/* Live interim transcript only in on-device-only mode */}
+                  {onDeviceOnly && status === "recording" && liveTranscript ? (
+                      <div className="rounded-2xl border bg-white p-4 text-sm text-zinc-700">
+                        <div className="text-xs font-semibold uppercase tracking-wide text-zinc-500">
+                          live transcript (on-device)
+                        </div>
+                        <div className="mt-2">{liveTranscript}</div>
+                      </div>
+                  ) : null}
+
+                  {/* Ephemeral assistant bubble (NOT persisted in messages) */}
+                  {status !== "idle" ? (
                       <div className="rounded-2xl border bg-zinc-900 text-zinc-50 p-4">
                         <div className="text-xs font-semibold uppercase tracking-wide opacity-70">assistant</div>
                         <div
                             className="mt-2 whitespace-pre-wrap leading-7"
-                            style={{ animation: "breath 2.2s ease-in-out infinite" }}
+                            style={{ animation: "anchorBreathe 2.2s ease-in-out infinite" }}
                         >
-                          {processingText}
+                          {status === "recording"
+                              ? "Listening carefully…"
+                              : "Reflecting on what you shared…"}
                         </div>
                       </div>
                   ) : null}
@@ -379,7 +635,8 @@ export default function Home() {
                   <div className="text-xs text-zinc-800">
                     mode: <span className="font-medium text-zinc-900">{lastMode}</span> · safety:{" "}
                     <span className="font-medium text-zinc-900">{lastSafety?.label || "unknown"}</span> · status:{" "}
-                    <span className="font-medium text-zinc-900">{status}</span>
+                    <span className="font-medium text-zinc-900">{status}</span> · stt:{" "}
+                    <span className="font-medium text-zinc-900">{onDeviceOnly ? "on-device" : "server"}</span>
                   </div>
                 </div>
               </>

@@ -1,3 +1,5 @@
+# apps/api/app/main.py
+
 from dotenv import load_dotenv
 load_dotenv()
 
@@ -13,6 +15,12 @@ from app.routes.sessions import router as sessions_router
 from app.routes.turns import router as turns_router
 from app.routes.chunks import router as chunks_router
 from app.routes.trends import router as trends_router
+
+# NEW ingest endpoints (transcript-only + /turns/audio fallback)
+from app.routes.turns_ingest import router as turns_ingest_router
+
+# NEW: wire self-hosted whisper (HTTP client)
+from app.wiring.self_hosted_stt import build_self_hosted_transcribe_callable
 
 
 def create_app() -> FastAPI:
@@ -48,11 +56,22 @@ def create_app() -> FastAPI:
     app.state.policy_version = getenv_default("POLICY_VERSION", "v1.0")
     app.state.model_version = getenv_default("MODEL_VERSION", "v1")
 
+    # ✅ Self-hosted transcription (used by /v1/sessions/{session_id}/turns/audio)
+    # Calls STT docker service via HTTP (no whisper inside API container)
+    app.state.self_hosted_transcribe = build_self_hosted_transcribe_callable()
+
     app.include_router(health_router)
     app.include_router(sessions_router)
+
+    # Existing v1 pipeline (chunked/audio -> finalize). Keep for compatibility.
     app.include_router(turns_router)
     app.include_router(chunks_router)
+
+    # Existing trends endpoint
     app.include_router(trends_router)
+
+    # NEW ingest endpoints (transcript-only + /turns/audio fallback)
+    app.include_router(turns_ingest_router)
 
     return app
 

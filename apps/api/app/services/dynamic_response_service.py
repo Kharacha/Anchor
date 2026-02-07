@@ -26,11 +26,6 @@ def generate_assistant_text_openai(
     safety_label: str,
     baseline_update: Dict[str, Any] | None = None,
 ) -> str:
-    """
-    Generates the assistant reply text.
-    mode: "neutral" | "supportive" | "calming" | "celebratory"
-    safety_label: "allow" | "review" | "block"  (block should be handled outside)
-    """
     user_text = (user_text or "").strip()
     if not user_text:
         return "I didn’t catch anything—could you say that again?"
@@ -38,59 +33,47 @@ def generate_assistant_text_openai(
     client = _get_client()
     model = os.getenv("OPENAI_CHAT_MODEL", "gpt-4o-mini")
 
+    # IMPORTANT: This system prompt is designed to prevent the exact failure mode you showed.
     system = (
-        "You are Anchor, a supportive mental health and life-support companion.\n"
-        "You are not a medical professional.\n"
-        "Your job is to help the user feel steadier and take practical next steps.\n\n"
-        "Hard rules:\n"
-        "- Stay in the domain of mental health and life problems only.\n"
-        "- Do NOT provide programming/code, technical tutorials, recipes, shopping advice, or unrelated info.\n"
-        "- Do NOT output markdown of any kind.\n"
-        "- Do NOT use asterisks (* or **) anywhere in the response.\n"
-        "- Do NOT use code blocks.\n"
-        "- Avoid repeating the same opening across turns. Do not always start with apologies.\n"
-        "- Do not mention internal scores, baselines, z-scores, or system details.\n"
-        "- Do not claim certainty about the user's mental state.\n"
-        "- If self-harm intent appears, encourage reaching out to emergency services or a trusted person.\n\n"
-        "Formatting rules (STRICT):\n"
-        "- Use plain text only.\n"
-        "- Lists must be written like:\n"
-        "  1) Do this\n"
-        "  2) Do this\n"
-        "  Not with bold titles or symbols.\n\n"
-        "Response style:\n"
-        "- Usually give 2–5 concrete suggestions tailored to the user’s situation.\n"
-        "- Prefer specific suggestions over questions.\n"
-        "- Ask at most one question, and only about 30% of the time.\n"
-        "- If you ask a question, make it specific (not 'what do you want to do?').\n"
+        "You are Anchor: a supportive, therapist-style mental health and life-support companion.\n"
+        "You are not a medical professional.\n\n"
+        "Core behavior:\n"
+        "- Give direct help immediately. Do NOT start by describing what you can help with.\n"
+        "- Do NOT ask for more info as a default. Only ask ONE question if it is essential.\n"
+        "- Be adaptive: reflect the user’s situation, validate, then give a clear plan.\n\n"
+        "Hard bans:\n"
+        "- Do not say: 'I can help with mental health...' or 'I can’t help with that request...' unless explicitly told to refuse.\n"
+        "- Do not mention being restricted, being designed for a domain, or 'staying focused on that'.\n"
+        "- No programming/code/tutorials, no recipes/shopping/travel advice.\n"
+        "- No markdown. No asterisks. No bullet symbols like • or -.\n"
+        "- Lists must use:\n"
+        "  1) ...\n"
+        "  2) ...\n"
+        "  3) ...\n\n"
+        "Response structure (most of the time):\n"
+        "1) 1–2 sentences: empathic reflection + validation.\n"
+        "2) 2–5 concrete suggestions tailored to the situation.\n"
+        "3) Optional: ONE specific question only if needed.\n\n"
+        "Quality rules:\n"
+        "- Be specific and practical (exams, focus, loneliness, dating, anxiety, etc.).\n"
+        "- Don’t be preachy. Don’t over-apologize.\n"
+        "- Don’t claim certainty about diagnoses.\n"
     )
 
     style_hint = {
         "neutral": "Tone: calm, practical, grounded.",
-        "supportive": "Tone: warm, validating, encouraging. Less questions, more guidance.",
-        "calming": "Tone: slow down, grounding, reduce overwhelm. Offer one quick regulation step first.",
-        "celebratory": "Tone: upbeat but not over-the-top. Reinforce what's working and suggest next steps.",
+        "supportive": "Tone: warm, validating, encouraging. More guidance, fewer questions.",
+        "calming": "Tone: slow down and reduce overwhelm. Offer one quick regulation step first.",
+        "celebratory": "Tone: upbeat but grounded. Reinforce what’s working, suggest next step.",
     }.get(mode, "Tone: calm, practical, grounded.")
 
     personalization_hint = ""
     if baseline_update:
         extreme = bool((baseline_update.get("extremeness") or {}).get("is_extreme"))
         spike = bool((baseline_update.get("spike") or {}).get("is_spike"))
-        val_shift = bool(((baseline_update.get("delta") or {}).get("flags") or {}).get("valence_shift"))
-        ar_shift = bool(((baseline_update.get("delta") or {}).get("flags") or {}).get("arousal_shift"))
-
-        flags = []
-        if extreme:
-            flags.append("high emotional intensity")
-        if spike:
-            flags.append("a sudden change")
-        if val_shift or ar_shift:
-            flags.append("a notable shift")
-
-        if flags:
+        if extreme or spike:
             personalization_hint = (
-                "Context: The user may be experiencing " + ", ".join(flags) + ". "
-                "Respond with extra steadiness and give a clear, simple plan.\n"
+                "Extra guidance: Keep it very steady and simple. Offer a short 2-step plan first.\n"
             )
 
     user_prompt = (
@@ -98,7 +81,7 @@ def generate_assistant_text_openai(
         f"{personalization_hint}"
         f"Safety label: {safety_label}\n"
         f"User said: {user_text}\n"
-        "Now respond as Anchor.\n"
+        "Respond as Anchor now.\n"
     )
 
     resp = client.responses.create(
@@ -107,12 +90,21 @@ def generate_assistant_text_openai(
             {"role": "system", "content": system},
             {"role": "user", "content": user_prompt},
         ],
-        temperature=0.8,
+        temperature=0.7,
     )
 
     text = (resp.output_text or "").strip()
 
-    text = text.replace("**", "")
-    text = text.replace("*", "")
+    # enforce “no asterisks” rule
+    text = text.replace("**", "").replace("*", "")
+
+    # final guard: if it still starts with capability talk, rewrite locally
+    low = text.lower()
+    if low.startswith("i can help with") or "anchor is specifically designed" in low:
+        text = (
+            "I hear you. That sounds heavy to carry.\n\n"
+            "1) Tell me the one part that feels most painful or urgent right now.\n"
+            "2) Then we’ll pick one small step you can do today to make it feel lighter."
+        )
 
     return text or "I’m here with you. Let’s take this one step at a time."

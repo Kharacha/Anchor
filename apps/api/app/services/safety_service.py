@@ -1,12 +1,28 @@
+# apps/api/app/services/safety_service.py
+from __future__ import annotations
+
 import json
 from uuid import UUID
+
+
+SELF_HARM_MARKERS = [
+    "how to kill myself",
+    "kill myself",
+    "suicide",
+    "self harm",
+    "hurt myself",
+    "cut myself",
+    "end my life",
+]
+
 
 def classify_input(text: str) -> tuple[dict, bool]:
     t = (text or "").lower()
 
-    # Placeholder rules. Keep it simple; we’ll swap in real classifier later.
-    if any(p in t for p in ["how to kill myself", "suicide", "self harm", "kill myself"]):
-        result = {"label": "block", "reasons": ["self_harm"], "meta": {}}
+    if any(p in t for p in SELF_HARM_MARKERS):
+        # Use "review" rather than "block" so the assistant can respond with crisis-safe support.
+        # "fallback_used=True" because we're overriding the normal generation path.
+        result = {"label": "review", "reasons": ["self_harm"], "meta": {}}
         return result, True
 
     result = {"label": "allow", "reasons": [], "meta": {}}
